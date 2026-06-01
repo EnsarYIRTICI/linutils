@@ -23,17 +23,17 @@
 set -euo pipefail
 
 # ---- defaults ----
-# Otomatik tespit edilebilir degerler, override edilebilir
 LAN_CIDR="${LAN_CIDR:-}"
 VPN_TUN="${VPN_TUN:-tun0}"
-LAN_IFACE="${LAN_IFACE:-}"       # eth1 gibi — bos birakilirsa otomatik tespit
-VPN_SERVER_IP="${VPN_SERVER_IP:-}"  # tin'in tun IP'si (10.8.0.1) — otomatik tespit
-MASQUERADE="${MASQUERADE:-yes}"  # LAN cihazlarinda VPN route yoksa yes olmali
+LAN_IFACE="${LAN_IFACE:-}"
+VPN_SERVER_IP="${VPN_SERVER_IP:-}"
+MASQUERADE="${MASQUERADE:-yes}"
 SAVE="${SAVE:-no}"
 ROLLBACK="${ROLLBACK:-no}"
 
 SYSCTL_FILE="/etc/sysctl.d/99-vpn-gw-side.conf"
 IPTABLES_HOOK="/etc/network/if-up.d/vpn-gw-side-iptables"
+OPENVPN_CONF_GLOB="/etc/openvpn/*.conf"
 
 # ---- renkler ----
 if [ -t 1 ]; then
@@ -122,7 +122,7 @@ ipt_check_add() {
     fi
   done
   if iptables "$@" 2>/dev/null; then
-    return 1  # zaten vardi
+    return 1
   fi
   iptables "${new_rule[@]}"
   return 0
@@ -143,28 +143,14 @@ ipt_delete_if_exists() {
   done
 }
 
-# tun0 arayzunun peer IP'sini (tin = VPN server) bul
 auto_detect_vpn_server_ip() {
-  # tun arayuzunun diger ucundaki IP = POINTOPOINT destination
-  ip addr show "$VPN_TUN" 2>/dev/null | \
-    awk '/inet / {split($4,a,"/"); if(a[1]!="") print a[1]; else split($2,b,"/"); print b[1]}' | \
-    head -1 || true
-  # Daha guvenilir yontem: routing table uzerinden tin'e giden next-hop
-  # (tun point-to-point oldugu icin peer IP bazen "peer" keyword ile gelir)
-}
-
-# tun0 peer IP'sini ip route ile bul
-auto_detect_vpn_server_ip_via_route() {
-  # tin sunucusu genellikle VPN subnet'inin .1'idir
   local tun_ip
   tun_ip=$(ip addr show "$VPN_TUN" 2>/dev/null | awk '/inet / {split($2,a,"/"); print a[1]}' | head -1)
   if [[ -n "$tun_ip" ]]; then
-    # .2 -> .1 gibi, son okteti 1 yap (basit heuristik)
     echo "${tun_ip%.*}.1"
   fi
 }
 
-# LAN arayuzunu otomatik tespit et (tun ve lo disindaki ilk UP arayuz)
 auto_detect_lan_iface() {
   ip -o link show | awk -F': ' '
     $2 != "lo" && $2 !~ /^tun/ && $2 !~ /^docker/ && $2 !~ /^br-/ && $2 !~ /^veth/ {
@@ -172,9 +158,16 @@ auto_detect_lan_iface() {
     }' | head -1
 }
 
-# Belirtilen arayuzun CIDR adresini al
 iface_cidr() {
   ip addr show "$1" 2>/dev/null | awk '/inet / {print $2; exit}'
+}
+
+# OpenVPN client config dosyasini bul
+find_openvpn_client_conf() {
+  for f in $OPENVPN_CONF_GLOB; do
+    [[ -f "$f" ]] && echo "$f" && return
+  done
+  echo ""
 }
 
 # ===========================================================
@@ -183,11 +176,10 @@ iface_cidr() {
 do_rollback() {
   info "Rollback basliyor..."
 
-  # LAN arayuzunu bul
   local lan_iface="${LAN_IFACE:-$(auto_detect_lan_iface)}"
-  local lan_cidr="${LAN_CIDR:-$(iface_cidr "$lan_iface" 2>/dev/null || echo "")}"
-  [[ -n "$lan_cidr" ]] && lan_cidr=$(normalize_cidr "$lan_cidr")
-  local vpn_server_ip="${VPN_SERVER_IP:-$(auto_detect_vpn_server_ip_via_route)}"
+  local lan_cidr_raw="${LAN_CIDR:-$(iface_cidr "$lan_iface" 2>/dev/null || echo "")}"
+  local lan_cidr=""
+  [[ -n "$lan_cidr_raw" ]] && lan_cidr=$(normalize_cidr "$lan_cidr_raw")
 
   # 1. iptables kurallari kaldir
   if [[ -n "$lan_iface" && -n "$lan_cidr" ]]; then
@@ -195,7 +187,6 @@ do_rollback() {
       -d "$lan_cidr" -j ACCEPT 2>/dev/null || true
     ipt_delete_if_exists -C FORWARD -i "$lan_iface" -o "$VPN_TUN" \
       -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-
     if [[ "${MASQUERADE,,}" == "yes" ]]; then
       ipt_delete_if_exists -t nat -C POSTROUTING -o "$lan_iface" \
         -d "$lan_cidr" -j MASQUERADE 2>/dev/null || true
@@ -203,7 +194,6 @@ do_rollback() {
     ok "iptables kurallari kaldirildi (varsa)"
   else
     warn "LAN arayuzu/CIDR tespit edilemedi, iptables rollback atlanıyor"
-    warn "Elle: iptables -D FORWARD ... ve iptables -t nat -D POSTROUTING ..."
   fi
 
   # 2. iptables hook dosyasini kaldir
@@ -215,9 +205,15 @@ do_rollback() {
   # 3. sysctl dosyasini kaldir
   if [[ -f "$SYSCTL_FILE" ]]; then
     rm -f "$SYSCTL_FILE"
-    sysctl -w net.ipv4.ip_forward=0 >/dev/null 2>/dev/null || true
-    ok "sysctl dosyasi kaldirildi, ip_forward=0 yapildi"
-    warn "ip_forward=0 yapildi — baska bir servis gerektiriyorsa tekrar aktif edin"
+    ok "sysctl dosyasi kaldirildi: $SYSCTL_FILE"
+  fi
+
+  # 4. OpenVPN config'den pull-filter satirini kaldir
+  local ovpn_conf
+  ovpn_conf=$(find_openvpn_client_conf)
+  if [[ -n "$ovpn_conf" ]]; then
+    sed -i '/^pull-filter ignore "redirect-gateway"/d' "$ovpn_conf"
+    ok "pull-filter satiri kaldirildi: $ovpn_conf"
   fi
 
   ok "Rollback tamamlandi."
@@ -230,11 +226,9 @@ do_rollback() {
 # OTOMATIK TESPIT
 # ===========================================================
 
-# tun0 var mi?
 ip link show "$VPN_TUN" >/dev/null 2>&1 || \
   die "VPN tunnel arayuzu bulunamadi: $VPN_TUN (OpenVPN bu makinede de calisiyor mu?)"
 
-# LAN arayuzunu tespit et
 if [[ -z "$LAN_IFACE" ]]; then
   LAN_IFACE=$(auto_detect_lan_iface)
   [[ -n "$LAN_IFACE" ]] || die "LAN arayuzu otomatik tespit edilemedi. --lan-iface ile belirtin."
@@ -243,7 +237,6 @@ fi
 
 ip link show "$LAN_IFACE" >/dev/null 2>&1 || die "Arayuz bulunamadi: $LAN_IFACE"
 
-# LAN CIDR'i tespit et
 if [[ -z "$LAN_CIDR" ]]; then
   LAN_CIDR_RAW=$(iface_cidr "$LAN_IFACE")
   [[ -n "$LAN_CIDR_RAW" ]] || die "$LAN_IFACE uzerinde IP adresi yok. --lan ile belirtin."
@@ -253,14 +246,12 @@ else
   LAN_CIDR=$(normalize_cidr "$LAN_CIDR")
 fi
 
-# VPN server IP'yi tespit et
 if [[ -z "$VPN_SERVER_IP" ]]; then
-  VPN_SERVER_IP=$(auto_detect_vpn_server_ip_via_route)
+  VPN_SERVER_IP=$(auto_detect_vpn_server_ip)
   [[ -n "$VPN_SERVER_IP" ]] || die "VPN server IP otomatik tespit edilemedi. --vpn-server-ip ile belirtin."
   info "Otomatik tespit edilen VPN server IP (tin): $VPN_SERVER_IP"
 fi
 
-# tun0'in kendi IP'si
 TUN_IP=$(ip addr show "$VPN_TUN" 2>/dev/null | awk '/inet / {split($2,a,"/"); print a[1]}' | head -1)
 [[ -n "$TUN_IP" ]] || die "$VPN_TUN uzerinde IP adresi yok."
 
@@ -278,21 +269,65 @@ echo ""
 # ===========================================================
 # 1. ip_forward
 # ===========================================================
-info "[1/4] ip_forward aktif ediliyor..."
+info "[1/5] ip_forward aktif ediliyor..."
 sysctl -w net.ipv4.ip_forward=1 >/dev/null
-if ! grep -q 'net.ipv4.ip_forward=1' "$SYSCTL_FILE" 2>/dev/null; then
-  echo 'net.ipv4.ip_forward=1' > "$SYSCTL_FILE"
-  ok "  $SYSCTL_FILE yazildi (kalici)"
+
+cat > "$SYSCTL_FILE" <<EOF
+# vpn-gw-side - otomatik olusturuldu
+net.ipv4.ip_forward = 1
+EOF
+
+ok "  ip_forward=1 ($SYSCTL_FILE)"
+
+# ===========================================================
+# 2. OpenVPN client config: redirect-gateway push'unu engelle
+#    (VPN yeniden baglandiginda 0.0.0.0/1 ve 128.0.0.0/1 route
+#     loop olusturmasini onler)
+# ===========================================================
+info "[2/5] OpenVPN client config guncelleniyor (pull-filter)..."
+
+OVPN_CONF=$(find_openvpn_client_conf)
+if [[ -n "$OVPN_CONF" ]]; then
+  if ! grep -q 'pull-filter ignore "redirect-gateway"' "$OVPN_CONF"; then
+    cp -a "$OVPN_CONF" "${OVPN_CONF}.bak.$(date +%Y%m%d-%H%M%S)"
+    echo 'pull-filter ignore "redirect-gateway"' >> "$OVPN_CONF"
+    ok "  pull-filter eklendi: $OVPN_CONF"
+    warn "  OpenVPN yeniden baslatiliyor: sistemctl restart openvpn@..."
+    # Servisi bul ve yeniden baslat
+    local svc
+    svc=$(systemctl list-units --full --all 'openvpn@*' 2>/dev/null \
+      | grep -oP 'openvpn@\S+\.service' | head -1 || true)
+    if [[ -n "$svc" ]]; then
+      systemctl restart "$svc"
+      ok "  $svc yeniden baslatildi"
+    else
+      warn "  OpenVPN servisi bulunamadi, elle yeniden baslatın"
+    fi
+  else
+    ok "  pull-filter zaten mevcut: $OVPN_CONF"
+  fi
+  # Reboot sonrasi da temiz kalsin: 0.0.0.0/1 ve 128.0.0.0/1 route'larini kaldir
+  ip route del 0.0.0.0/1 2>/dev/null && ok "  0.0.0.0/1 route kaldirildi" || true
+  ip route del 128.0.0.0/1 2>/dev/null && ok "  128.0.0.0/1 route kaldirildi" || true
 else
-  ok "  ip_forward zaten aktif"
+  warn "  OpenVPN client config bulunamadi ($OPENVPN_CONF_GLOB)"
+  warn "  Elle ekleyin: echo 'pull-filter ignore \"redirect-gateway\"' >> /etc/openvpn/*.conf"
+  # Yine de mevcut session'daki route'lari temizle
+  ip route del 0.0.0.0/1 2>/dev/null && ok "  0.0.0.0/1 route kaldirildi" || true
+  ip route del 128.0.0.0/1 2>/dev/null && ok "  128.0.0.0/1 route kaldirildi" || true
 fi
 
 # ===========================================================
-# 2. iptables: FORWARD (tun0 -> eth1 ve geri donus)
+# 3. iptables: FORWARD (tun0 -> eth1 ve geri donus)
 # ===========================================================
-info "[2/4] iptables FORWARD kurallari ekleniyor..."
+info "[3/5] iptables FORWARD kurallari ekleniyor..."
 
-# VPN'den LAN'a giden paketlere izin ver
+# Docker varsa FORWARD policy DROP olabilir - kontrol et
+FORWARD_POLICY=$(iptables -L FORWARD --line-numbers -n 2>/dev/null | head -1 | grep -oP 'policy \K\w+' || echo "UNKNOWN")
+if [[ "$FORWARD_POLICY" == "DROP" ]]; then
+  warn "  FORWARD policy DROP (muhtemelen Docker). Kurallar buna gore ekleniyor."
+fi
+
 R1=(-C FORWARD -i "$VPN_TUN" -o "$LAN_IFACE" -d "$LAN_CIDR" -j ACCEPT)
 if ipt_check_add "${R1[@]}"; then
   ok "  FORWARD (${VPN_TUN} -> ${LAN_IFACE}, dst: $LAN_CIDR) eklendi"
@@ -300,8 +335,7 @@ else
   ok "  FORWARD (${VPN_TUN} -> ${LAN_IFACE}, dst: $LAN_CIDR) zaten mevcut"
 fi
 
-# LAN'dan VPN'e donus paketlerine izin ver (ESTABLISHED/RELATED)
-R2=(-C FORWARD -i "$LAN_IFACE" -o "$VPN_TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT)
+R2=(-C FORWARD -i "$LAN_IFACE" -o "$VPN_TUN" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT)
 if ipt_check_add "${R2[@]}"; then
   ok "  FORWARD (${LAN_IFACE} -> ${VPN_TUN}, ESTABLISHED/RELATED) eklendi"
 else
@@ -309,16 +343,9 @@ else
 fi
 
 # ===========================================================
-# 3. iptables: MASQUERADE (opsiyonel)
+# 4. iptables: MASQUERADE
 # ===========================================================
-info "[3/4] MASQUERADE kurali..."
-
-# MASQUERADE ne zaman gerekli?
-# - LAN icindeki cihazlar VPN network'une nasil route edeceklerini bilmiyorlarsa
-#   (yani LAN gatewayinde "10.8.0.0/24 via 10.77.3.3" gibi bir route yoksa)
-# - Bu durumda tin-gateway kaynak IP'yi kendi eth1 IP'si ile degistirir,
-#   LAN cihazlari normal eth1 IP'sine cevap verir, geri donus olur.
-# --masquerade no yapabilirsin eger LAN'daki router/switch bu routing'i biliyor ise.
+info "[4/5] MASQUERADE kurali..."
 
 if [[ "${MASQUERADE,,}" == "yes" ]]; then
   R3=(-t nat -C POSTROUTING -o "$LAN_IFACE" -d "$LAN_CIDR" -j MASQUERADE)
@@ -329,17 +356,15 @@ if [[ "${MASQUERADE,,}" == "yes" ]]; then
   fi
 else
   warn "  MASQUERADE atlanıyor (--masquerade no)"
-  warn "  LAN routerinizde/switch'inizde '10.8.0.0/24 via 10.77.3.3' route olmali!"
+  warn "  LAN routerinizde/switch'inizde '10.8.0.0/24 via $TUN_IP' route olmali!"
 fi
 
 # ===========================================================
-# 4. Kaydet (opsiyonel)
+# 5. Kaydet (opsiyonel)
 # ===========================================================
-info "[4/4] Kayit..."
+info "[5/5] Kayit..."
 
 if [[ "${SAVE,,}" == "yes" ]]; then
-
-  # iptables kurallari kaydet
   if command -v netfilter-persistent >/dev/null 2>&1; then
     netfilter-persistent save
     ok "  netfilter-persistent ile kaydedildi"
@@ -348,7 +373,6 @@ if [[ "${SAVE,,}" == "yes" ]]; then
     iptables-save > /etc/iptables/rules.v4
     ok "  /etc/iptables/rules.v4 guncellendi"
   else
-    # iptables-persistent yoksa if-up.d hook ile kalici yap
     warn "  iptables-persistent bulunamadi; if-up.d hook yaziliyor"
     warn "  Daha guvenilir kalicilik icin: apt install iptables-persistent"
     cat > "$IPTABLES_HOOK" <<HOOK
@@ -357,8 +381,8 @@ if [[ "${SAVE,,}" == "yes" ]]; then
 [ "\$IFACE" = "$LAN_IFACE" ] || [ "\$IFACE" = "$VPN_TUN" ] || exit 0
 iptables -C FORWARD -i $VPN_TUN -o $LAN_IFACE -d $LAN_CIDR -j ACCEPT 2>/dev/null || \
   iptables -A FORWARD -i $VPN_TUN -o $LAN_IFACE -d $LAN_CIDR -j ACCEPT
-iptables -C FORWARD -i $LAN_IFACE -o $VPN_TUN -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
-  iptables -A FORWARD -i $LAN_IFACE -o $VPN_TUN -m state --state RELATED,ESTABLISHED -j ACCEPT
+iptables -C FORWARD -i $LAN_IFACE -o $VPN_TUN -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+  iptables -A FORWARD -i $LAN_IFACE -o $VPN_TUN -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 HOOK
     if [[ "${MASQUERADE,,}" == "yes" ]]; then
       cat >> "$IPTABLES_HOOK" <<HOOK
@@ -375,6 +399,18 @@ else
 fi
 
 # ===========================================================
+# DOGRULAMA TESTI
+# ===========================================================
+echo ""
+info "Baglanti testi yapiliyor..."
+
+if ping -c2 -W2 "$VPN_SERVER_IP" >/dev/null 2>&1; then
+  ok "  VPN server erisilebilir: $VPN_SERVER_IP"
+else
+  warn "  VPN server ping basarisiz: $VPN_SERVER_IP"
+fi
+
+# ===========================================================
 # OZET
 # ===========================================================
 echo ""
@@ -384,25 +420,11 @@ echo -e "${BOLD}============================================${NC}"
 echo ""
 echo -e "${BOLD}Dogrulama komutlari (bu makinede):${NC}"
 echo ""
-echo "  # ip_forward aktif mi?"
-echo "  cat /proc/sys/net/ipv4/ip_forward   # 1 olmali"
-echo ""
-echo "  # FORWARD kurallari mevcut mu?"
-echo "  iptables -L FORWARD -n --line-numbers | grep -E '${VPN_TUN}|${LAN_IFACE}'"
-echo ""
-if [[ "${MASQUERADE,,}" == "yes" ]]; then
-  echo "  # MASQUERADE kurali mevcut mu?"
-  echo "  iptables -t nat -L POSTROUTING -n --line-numbers | grep MASQUERADE"
-  echo ""
-fi
-echo -e "${BOLD}Test (VPN clientlarindan):${NC}"
-echo ""
-echo "  ping -c3 $TUN_IP             # VPN client -> tin-gateway tun"
-echo "  ping -c3 ${LAN_CIDR%/*}   # VPN client -> LAN network adresi"
-echo "  # LAN'daki herhangi bir hostin IP'sini ping'le:"
-echo "  # ping -c3 10.77.x.x"
+echo "  cat /proc/sys/net/ipv4/ip_forward"
+echo "  iptables -L FORWARD -n --line-numbers"
+echo "  ip route show   # 0.0.0.0/1 ve 128.0.0.0/1 OLMAMALI"
 echo ""
 echo -e "${BOLD}tin (VPN server) tarafinda da script calismis olmali:${NC}"
 echo "  reach-gateway.sh --gateway-tun-ip $TUN_IP --lan $LAN_CIDR --gateway-cn <CN> --save yes"
-echo "  sudo systemctl restart openvpn-server@server   # tin'de"
+echo "  sudo systemctl restart openvpn-server@server"
 echo ""
